@@ -1,0 +1,160 @@
+# Makefile for reproduce_c (C + C++ hybrid compilation)
+
+CC = gcc
+CXX = g++
+
+# DPU parameter configuration (can be passed via environment variables, consistent with build.sh)
+NR_DPUS ?= 600
+VIRTUAL_DPUS ?= $(NR_DPUS)
+BATCH_SIZE ?= 200
+DIMM ?= 420
+PADDED_DIMM ?= 512
+MAX_SIZE_PER_DPU ?= 300000
+DEGREE ?= 32
+MAX_QUERY_CLUSTER_PER_DPU ?= 1600
+POST_EF ?= 30
+EF ?= 100
+
+# DPU configuration macro definitions
+DPU_DEFINES = -DNR_DPUS=$(NR_DPUS) \
+              -DVIRTUAL_DPUS=$(VIRTUAL_DPUS) \
+              -DBATCH_SIZE=$(BATCH_SIZE) \
+              -DDIMM=$(DIMM) \
+              -DPADDED_DIMM=$(PADDED_DIMM) \
+              -DMAX_SIZE_PER_DPU=$(MAX_SIZE_PER_DPU) \
+              -DDEGREE=$(DEGREE) \
+              -DMAX_QUERY_CLUSTER_PER_DPU=$(MAX_QUERY_CLUSTER_PER_DPU) \
+              -DPOST_EF=$(POST_EF) \
+              -DEF=${EF} \
+              $(if $(QUERIES_PER_PUSH),-DQUERIES_PER_PUSH=$(QUERIES_PER_PUSH),) \
+              $(if $(INPUT_FIFO_PTR_SIZE),-DINPUT_FIFO_PTR_SIZE=$(INPUT_FIFO_PTR_SIZE),) \
+              $(if $(OUTPUT_FIFO_PTR_SIZE),-DOUTPUT_FIFO_PTR_SIZE=$(OUTPUT_FIFO_PTR_SIZE),)
+
+# DPU configuration
+DPU_CFLAGS = $(shell dpu-pkg-config --cflags dpu)
+DPU_LDFLAGS = $(shell dpu-pkg-config --libs dpu)
+
+CFLAGS = -std=c11 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -I./include -I../symqglib $(DPU_CFLAGS) $(DPU_DEFINES)
+CXXFLAGS = -std=c++17 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -I./include -I../symqglib $(DPU_DEFINES)
+LDFLAGS = -lm -fopenmp -lstdc++ $(DPU_LDFLAGS)
+
+# C source files (performance: DPU FIFO mode)
+C_SRCS = src/main.c src/utils.c src/ivf_search.c src/hashtable.c src/error.c
+C_OBJS = $(C_SRCS:.c=.o)
+
+# C source files (recall: pure CPU mode, no DPU)
+RECALL_C_SRCS = src/main_cpu_recall.c src/utils.c src/ivf_search.c src/hashtable.c src/error.c
+RECALL_C_OBJS = $(RECALL_C_SRCS:.c=.o)
+
+# C++ source files (bindings)
+CXX_SRCS = src/symqg_c_binding.cpp
+CXX_OBJS = $(CXX_SRCS:.cpp=.o)
+
+# All object files
+OBJS = $(C_OBJS) $(CXX_OBJS)
+RECALL_OBJS = $(RECALL_C_OBJS) $(CXX_OBJS)
+
+# Example program source files
+EXAMPLE_C_SRCS = example_usage.c src/utils.c src/ivf_search.c src/hashtable.c src/error.c
+EXAMPLE_C_OBJS = $(EXAMPLE_C_SRCS:.c=.o)
+EXAMPLE_OBJS = $(EXAMPLE_C_OBJS) $(CXX_OBJS)
+
+# Target executable files
+TARGET = bin/reproduce_c
+HOST_CODE = bin/host_code
+HOST_RECALL = bin/host_recall
+HOST_CODE_ASM = bin/host_code.S
+EXAMPLE_TARGET = example_usage
+
+# Default target
+all: $(TARGET)
+
+# DPU version - compile host_code
+host: $(HOST_CODE) $(HOST_CODE_ASM)
+
+# Recall version - compile host_recall (pure CPU, no DPU)
+recall: $(HOST_RECALL)
+
+# Main program
+$(TARGET): $(OBJS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Build completed: $(TARGET)"
+
+# Host code (for DPU)
+$(HOST_CODE): $(OBJS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Build completed: $(HOST_CODE)"
+
+# Host recall code (pure CPU, no DPU)
+# Uses C11 flags without DPU SDK, but still links C++ for symqg
+RECALL_CFLAGS = -std=c11 -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -I./include -I../symqglib $(DPU_DEFINES)
+$(HOST_RECALL): $(RECALL_OBJS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Build completed: $(HOST_RECALL)"
+
+# Host code assembly file
+$(HOST_CODE_ASM): $(HOST_CODE)
+	@mkdir -p bin
+	objdump -d -S $< > $@
+	@echo "Generated assembly: $(HOST_CODE_ASM)"
+
+# Example program
+example: $(EXAMPLE_TARGET)
+
+$(EXAMPLE_TARGET): $(EXAMPLE_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Build completed: $(EXAMPLE_TARGET)"
+
+# C compilation rules
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# C++ compilation rules
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Clean
+clean:
+	rm -f $(C_OBJS) $(RECALL_C_OBJS) $(CXX_OBJS) $(EXAMPLE_C_OBJS) $(TARGET) $(HOST_CODE) $(HOST_RECALL) $(HOST_CODE_ASM) $(EXAMPLE_TARGET)
+	rm -rf build
+	@echo "Clean completed"
+
+# Clean all results
+clean-all: clean
+	rm -rf bin results
+	@echo "Clean all completed"
+
+# Run main program
+run: $(TARGET)
+	cd .. && ./reproduce_cpp/$(TARGET)
+
+# Run example
+run-example: $(EXAMPLE_TARGET)
+	./$(EXAMPLE_TARGET)
+
+# Memory check
+valgrind: $(TARGET)
+	cd .. && valgrind --leak-check=full --show-leak-kinds=all ./reproduce_cpp/$(TARGET)
+
+valgrind-example: $(EXAMPLE_TARGET)
+	valgrind --leak-check=full --show-leak-kinds=all ./$(EXAMPLE_TARGET)
+
+# Help info
+help:
+	@echo "Available targets:"
+	@echo "  all            - Build main program (default)"
+	@echo "  host           - Build host_code and host_code.S (for DPU performance)"
+	@echo "  recall         - Build host_recall (pure CPU, for recall testing)"
+	@echo "  example        - Build example program"
+	@echo "  clean          - Remove object files and executables"
+	@echo "  clean-all      - Remove all generated files including results"
+	@echo "  run            - Build and run main program"
+	@echo "  run-example    - Build and run example program"
+	@echo "  valgrind       - Run main program with valgrind memory check"
+	@echo "  valgrind-example - Run example with valgrind memory check"
+	@echo "  help           - Show this help message"
+
+.PHONY: all host example clean clean-all run run-example valgrind valgrind-example help
